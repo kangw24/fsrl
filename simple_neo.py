@@ -40,8 +40,9 @@ class TrainConfig:
     bs: int = 32
     gc: float = 2.0
     eps: float = 1e-6
-    nbiter: int = 30000
-    save_every: int = 200
+  # nbiter: int = 30000  # 旧版短 episode 用的迭代数
+    nbiter: int = 5000  # 新任务每 episode ≈1184 步，总计算量约为旧版 30000×120 的数倍
+    save_every: int = 100
     pe: int = 101
     cs: int = 15
     # triallen: int = 4  # 旧版：所有 trial 统一步数
@@ -438,6 +439,31 @@ def prepare_trial(config, nbcues, cue_pair, phase):
     return cues, cue_pairs, correct_order, adjacent, delta
 
 
+def compute_trial_loss(config, trial_rewards, trial_values, trial_logprobs, bent, triallen):
+    """
+    单个 trial 内的损失（bent + 价值预测 + 策略梯度占位）。
+    配合 trial 末 pw.detach()，避免 1184 步整图反传导致 OOM。
+    """
+    loss = bent
+    lossv = 0
+    bootstrap_return = torch.zeros(config.bs, device=DEVICE)
+    for step_idx in reversed(range(triallen)):
+        bootstrap_return = config.gr * bootstrap_return + torch.from_numpy(
+            trial_rewards[step_idx]
+        ).to(DEVICE)
+        advantage = bootstrap_return - trial_values[step_idx][:, 0]
+        lossv = lossv + advantage.pow(2).sum() / config.bs
+        loss_multiplier = 0.0  # 观察学习 / 测试无反馈：策略梯度关闭
+        loss = (
+            loss
+            - loss_multiplier
+            * (trial_logprobs[step_idx] * advantage.detach()).sum()
+            / config.bs
+        )
+    loss = loss + config.blossv * lossv
+    return loss / triallen
+
+
 def run_single_trial(
     config,
     net,
@@ -450,24 +476,25 @@ def run_single_trial(
     et,
     pw,
     numstep_ep,
-    rewards,
-    logprobs,
-    values,
-    step_phases,
     correct_thisep,
     istest_thisep,
     test_counters,
-    loss_container,
     print_trace=False,
     test_responses=None,
     block_id=None,
+    compute_loss=False,
 ):
     """执行单个 trial（学习或测试），并记录逐步状态。"""
     triallen = config.learn_triallen if phase == "learn" else config.test_triallen
 
-    # 每个 trial 重置隐状态与资格迹；可塑权重 pw 跨 trial 保留
+    # 每个 trial 重置隐状态与资格迹；可塑权重 pw 跨 trial 保留（值保留，图在 trial 末截断）
     hidden = net.initialZeroState(config.bs)
     et = net.initialZeroET(config.bs)
+
+    trial_rewards = []
+    trial_values = []
+    trial_logprobs = []
+    bent = torch.tensor(0.0, device=DEVICE)
 
     cues, cue_pairs, correct_order, adjacent, delta = prepare_trial(
         config, nbcues, scheduled_pair, phase
@@ -506,11 +533,10 @@ def run_single_trial(
             y = torch.softmax(y_raw, dim=1)
             distrib = torch.distributions.Categorical(y)
             actions = distrib.sample()
-            logprobs.append(distrib.log_prob(actions))
+            trial_logprobs.append(distrib.log_prob(actions))
             previous_actions = actions.detach().cpu().numpy()
         else:
-            # 观察学习：不采样动作，策略梯度占位为零
-            logprobs.append(torch.zeros(config.bs, device=DEVICE))
+            trial_logprobs.append(torch.zeros(config.bs, device=DEVICE))
             previous_actions = np.zeros(config.bs, dtype=np.int32)
             y = torch.softmax(y_raw, dim=1)
 
@@ -576,11 +602,17 @@ def run_single_trial(
                 #     correct_answer[batch_index] = 0
                 pass
 
-        rewards.append(reward)
-        values.append(value)
-        step_phases.append(phase)
-        loss_container[0] = loss_container[0] + config.bent * y.pow(2).sum() / config.bs
+        trial_rewards.append(reward)
+        trial_values.append(value)
+        bent = bent + config.bent * y.pow(2).sum() / config.bs
         numstep_ep += 1
+
+    trial_loss = None
+    if compute_loss:
+        trial_loss = compute_trial_loss(
+            config, trial_rewards, trial_values, trial_logprobs, bent, triallen
+        )
+        trial_loss = trial_loss + config.lpw * torch.mean(pw**2) / config.nbtrials
 
     if phase == "test":
         test_counters["nbtesttrials"] += config.bs
@@ -594,7 +626,10 @@ def run_single_trial(
             np.sum((1 - adjacent) * correct_answer)
         )
 
-    return hidden, et, pw, numstep_ep
+    # 截断 BPTT：保留 pw 数值，切断跨 trial 的计算图，防止 1184 步整图 OOM
+    pw = pw.detach()
+
+    return hidden, et, pw, numstep_ep, trial_loss
 
 
 def _run_episode_blocks(
@@ -603,22 +638,18 @@ def _run_episode_blocks(
     nbcues,
     print_trace=False,
     collect_responses=False,
+    training=False,
 ):
     """
     执行 episode 的学习 + 测试 block 循环（训练与 eval 共用）。
-    collect_responses=True 时采集 TestResponse 供分析环节使用。
+    training=True 时按 trial 反传（截断 BPTT），避免整 episode 图导致 OOM。
     """
     hidden = net.initialZeroState(config.bs)
     et = net.initialZeroET(config.bs)
     pw = net.initialZeroPlasticWeights(config.bs)
     cue_data = generate_cue_data(config, nbcues)
 
-    rewards = []
-    values = []
-    logprobs = []
-    step_phases = []
     test_responses = [] if collect_responses else None
-
     correct_thisep = np.zeros((config.bs, config.nbtrials))
     istest_thisep = np.zeros((config.bs, config.nbtrials))
 
@@ -631,7 +662,7 @@ def _run_episode_blocks(
         "nbtesttrials_nonadjacent_correct": 0,
     }
 
-    loss_container = [0.0]
+    loss_sum = 0.0
 
     blank_inputs = torch.zeros(config.bs, config.inputsize, requires_grad=False).to(
         DEVICE
@@ -644,70 +675,47 @@ def _run_episode_blocks(
     global_trial_idx = 0
     numstep_ep = 0
 
+    def _run_scheduled_trial(scheduled_pair, phase, block_id):
+        nonlocal hidden, et, pw, numstep_ep, loss_sum
+        hidden, et, pw, numstep_ep, trial_loss = run_single_trial(
+            config,
+            net,
+            nbcues,
+            cue_data,
+            scheduled_pair,
+            phase=phase,
+            global_trial_idx=global_trial_idx,
+            hidden=hidden,
+            et=et,
+            pw=pw,
+            numstep_ep=numstep_ep,
+            correct_thisep=correct_thisep,
+            istest_thisep=istest_thisep,
+            test_counters=test_counters,
+            print_trace=print_trace,
+            test_responses=test_responses,
+            block_id=block_id,
+            compute_loss=training,
+        )
+        if training and trial_loss is not None:
+            scaled = trial_loss / config.nbtrials
+            scaled.backward()
+            loss_sum += float(trial_loss.detach())
+
     for learn_block in range(config.nb_learn_blocks):
         learn_schedule = shuffle_schedule(supervision_set)
         for scheduled_pair in learn_schedule:
-            hidden, et, pw, numstep_ep = run_single_trial(
-                config,
-                net,
-                nbcues,
-                cue_data,
-                scheduled_pair,
-                phase="learn",
-                global_trial_idx=global_trial_idx,
-                hidden=hidden,
-                et=et,
-                pw=pw,
-                numstep_ep=numstep_ep,
-                rewards=rewards,
-                logprobs=logprobs,
-                values=values,
-                step_phases=step_phases,
-                correct_thisep=correct_thisep,
-                istest_thisep=istest_thisep,
-                test_counters=test_counters,
-                loss_container=loss_container,
-                print_trace=print_trace,
-                test_responses=test_responses,
-                block_id=None,
-            )
+            _run_scheduled_trial(scheduled_pair, "learn", None)
             global_trial_idx += 1
 
     for test_block in range(config.nb_test_blocks):
         test_schedule = shuffle_schedule(query_set)
         for scheduled_pair in test_schedule:
-            hidden, et, pw, numstep_ep = run_single_trial(
-                config,
-                net,
-                nbcues,
-                cue_data,
-                scheduled_pair,
-                phase="test",
-                global_trial_idx=global_trial_idx,
-                hidden=hidden,
-                et=et,
-                pw=pw,
-                numstep_ep=numstep_ep,
-                rewards=rewards,
-                logprobs=logprobs,
-                values=values,
-                step_phases=step_phases,
-                correct_thisep=correct_thisep,
-                istest_thisep=istest_thisep,
-                test_counters=test_counters,
-                loss_container=loss_container,
-                print_trace=print_trace,
-                test_responses=test_responses,
-                block_id=test_block,
-            )
+            _run_scheduled_trial(scheduled_pair, "test", test_block)
             global_trial_idx += 1
 
     return {
-        "rewards": rewards,
-        "values": values,
-        "logprobs": logprobs,
-        "step_phases": step_phases,
-        "loss_container": loss_container,
+        "loss_sum": loss_sum,
         "test_counters": test_counters,
         "pw": pw,
         "supervision_set": supervision_set,
@@ -717,116 +725,21 @@ def _run_episode_blocks(
 
 
 def run_episode(config, net, nbcues, print_trace=False):
-    """运行完整 episode：学习 blocks + 测试 blocks，并返回可微训练损失。"""
+    """运行完整 episode：学习 blocks + 测试 blocks；按 trial 反传，返回损失统计。"""
     state = _run_episode_blocks(
-        config, net, nbcues, print_trace=print_trace, collect_responses=False
+        config,
+        net,
+        nbcues,
+        print_trace=print_trace,
+        collect_responses=False,
+        training=True,
     )
 
-    rewards = state["rewards"]
-    values = state["values"]
-    logprobs = state["logprobs"]
-    step_phases = state["step_phases"]
-    loss_container = state["loss_container"]
-    test_counters = state["test_counters"]
     pw = state["pw"]
-
-    lossv = 0
-    # reward = np.zeros(config.bs, dtype="float32")
-    # sumrewardtest = np.zeros(config.bs)
-    # nbtrials = np.zeros(config.bs)
-    # previous_actions = np.zeros(config.bs, dtype="int32")
-    # nbtesttrials = 0
-    # nbtesttrials_correct = 0
-    # nbtesttrials_adjacent = 0
-    # nbtesttrials_adjacent_correct = 0
-    # nbtesttrials_nonadjacent = 0
-    # nbtesttrials_nonadjacent_correct = 0
-    # loss = 0
-    # numstep_ep = 0
-    # for numtrial in range(config.nbtrials):
-    #     hidden = net.initialZeroState(config.bs)
-    #     et = net.initialZeroET(config.bs)
-    #     cues, cue_pairs, correct_order, adjacent = prepare_trial(
-    #         config, nbcues, nbtrials
-    #     )
-    #     istest_thisep[:, numtrial] = 1 if numtrial >= config.nbtraintrials else 0
-    #     correct_answer = np.zeros(config.bs)
-    #     for numstep in range(config.triallen):
-    #         inputs = build_step_inputs(
-    #             config, nbcues, cue_data, cues, reward, previous_actions,
-    #             numstep, numstep_ep,
-    #         )
-    #         y_raw, value, daout, hidden, et, pw = net(inputs, hidden, et, pw)
-    #         y = torch.softmax(y_raw, dim=1)
-    #         distrib = torch.distributions.Categorical(y)
-    #         actions = distrib.sample()
-    #         logprobs.append(distrib.log_prob(actions))
-    #         previous_actions = actions.detach().cpu().numpy()
-    #         reward = np.zeros(config.bs, dtype="float32")
-    #         for batch_index in range(config.bs):
-    #             if numstep == NUMRESPONSESTEP:
-    #                 correct_answer[batch_index] = 1
-    #                 chose_item_1 = previous_actions[batch_index] == 1
-    #                 if (correct_order[batch_index] and chose_item_1) or (
-    #                     (not correct_order[batch_index]) and not chose_item_1
-    #                 ):
-    #                     reward[batch_index] += config.rew
-    #                 else:
-    #                     reward[batch_index] -= config.rew
-    #                     correct_answer[batch_index] = 0
-    #                 correct_thisep[batch_index, numtrial] = correct_answer[batch_index]
-    #             if numstep == config.triallen - 1:
-    #                 nbtrials[batch_index] += 1
-    #         rewards.append(reward)
-    #         values.append(value)
-    #         if numtrial >= config.nbtrials - config.nbtesttrials:
-    #             sumrewardtest += reward
-    #         loss = loss + config.bent * y.pow(2).sum() / config.bs
-    #         numstep_ep += 1
-    #     if numtrial >= config.nbtrials - config.nbtesttrials:
-    #         sumrewardtest += reward
-    #         nbtesttrials += config.bs
-    #         nbtesttrials_correct += np.sum(correct_answer)
-    #         nbtesttrials_adjacent += np.sum(adjacent)
-    #         nbtesttrials_adjacent_correct += np.sum(adjacent * correct_answer)
-    #         nbtesttrials_nonadjacent += np.sum(1 - adjacent)
-    #         nbtesttrials_nonadjacent_correct += np.sum(
-    #             (1 - adjacent) * correct_answer
-    #         )
-
-    loss = loss_container[0]
-    bootstrap_return = torch.zeros(config.bs, requires_grad=False).to(DEVICE)
-    for numstepb in reversed(range(config.eplen)):
-        bootstrap_return = config.gr * bootstrap_return + torch.from_numpy(
-            rewards[numstepb]
-        ).detach().to(DEVICE)
-        advantage = bootstrap_return - values[numstepb][:, 0]
-        lossv = lossv + advantage.pow(2).sum() / config.bs
-
-        # 测试阶段无反馈：不将测试步纳入策略梯度
-        if step_phases[numstepb] == "test":
-            loss_multiplier = 0.0
-        else:
-            # 观察学习阶段同样不做策略梯度（无显式选择与 reward）
-            loss_multiplier = 0.0
-        # 旧版：测试步使用更高 loss 权重
-        # loss_multiplier = (
-        #     config.testlmult
-        #     if numstepb > config.eplen - config.triallen * config.nbtesttrials
-        #     else 1.0
-        # )
-
-        loss = (
-            loss
-            - loss_multiplier
-            * (logprobs[numstepb] * advantage.detach()).sum()
-            / config.bs
-        )
-
-    loss_objective = float(loss.detach())
-    loss = loss + config.blossv * lossv
-    loss = loss / config.eplen
-    loss = loss + torch.mean(pw**2) * config.lpw
+    test_counters = state["test_counters"]
+    loss_sum = state["loss_sum"]
+    loss_value = loss_sum / max(config.nbtrials, 1)
+    loss_tensor = torch.tensor(loss_value, device=DEVICE)
 
     nbtesttrials = test_counters["nbtesttrials"]
     nbtesttrials_correct = test_counters["nbtesttrials_correct"]
@@ -848,10 +761,10 @@ def run_episode(config, net, nbcues, print_trace=False):
         )
 
     return EpisodeStats(
-        loss=loss,
-        loss_value=float(loss.detach()),
-        loss_objective=loss_objective,
-        test_reward_mean=0.0,  # 测试无反馈，reward 均值恒为 0
+        loss=loss_tensor,
+        loss_value=loss_value,
+        loss_objective=loss_value,
+        test_reward_mean=0.0,
         nbtesttrials=nbtesttrials,
         test_perf=test_perf,
         test_perf_adjacent=test_perf_adjacent,
@@ -1033,7 +946,7 @@ def train(config, output_dir, trace_steps=False):
 
         optimizer.zero_grad()
         stats = run_episode(config, net, nbcues=nbcues, print_trace=print_trace)
-        stats.loss.backward()
+        # 梯度已在 run_episode 内按 trial 累积反传
         torch.nn.utils.clip_grad_norm_(net.parameters(), config.gc)
         if episode_index > 100:
             optimizer.step()
@@ -1087,10 +1000,10 @@ def parse_args():
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--nbiter", type=int, default=30000)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--nbiter", type=int, default=5000)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=-1)
-    parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--print-every", type=int, default=101)
     parser.add_argument("--output-dir", default=str(ROOT_DIR))
     parser.add_argument("--nbcues", type=int, default=8, help="元素数量（Mermaid 默认 8）")
