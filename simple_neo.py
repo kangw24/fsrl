@@ -57,8 +57,13 @@ class TrainConfig:
     l2: float = 0.0
     lr: float = 1e-4
     lpw: float = 1e-4
-    nbcues: int = 8  # Mermaid 默认：固定 8 个抽象元素 e₁…e₈
+    nbcues: int = 8  # Mermaid 默认：8 个元素；全序 0≻1≻…≻7（编号越小越强）
     analyze_on_save: bool = False  # checkpoint 时是否运行分析环节
+    # 观察学习：随机左右呈现，使 teacher_da 有正有负（stim1 赢 → +1，stim2 赢 → -1）
+    learn_shuffle_presentation: bool = True
+    # 离线辅助监督（行为仍无反馈；仅用于 meta-train 反传）
+    baux_learn: float = 0.5  # 学习阶段 pair 呈现步的 CE
+    baux_test: float = 1.0  # 测试决策步的 CE
 
     @property
     def nbcuesrange(self):
@@ -403,45 +408,67 @@ def build_step_inputs(
     return torch.from_numpy(inputs).detach().to(DEVICE)
 
 
+def stronger_cue_index(i: int, j: int) -> int:
+    """真实全序：编号越小越强（0 最强）。"""
+    return min(i, j)
+
+
+def weaker_cue_index(i: int, j: int) -> int:
+    return max(i, j)
+
+
+def default_true_rank(nbcues: int) -> list[int]:
+    """从强到弱的 cue 编号列表（与 stronger_cue_index 一致）。"""
+    return list(range(nbcues))
+
+
 def prepare_trial(config, nbcues, cue_pair, phase):
     """根据 block schedule 给定 pair 构造 trial，不再随机采样。"""
     cues = []
     cue_pairs = []
     correct_order = np.zeros(config.bs)
     adjacent = np.zeros(config.bs)
+    teacher_signal = np.zeros(config.bs, dtype=np.float32)
 
     if len(cue_pair) == 3:
-        pair = [cue_pair[0], cue_pair[1]]
-        delta = cue_pair[2]
+        i, j, delta = cue_pair[0], cue_pair[1], cue_pair[2]
     else:
-        pair = [cue_pair[0], cue_pair[1]]
-        delta = abs(pair[0] - pair[1])
+        i, j = cue_pair[0], cue_pair[1]
+        delta = abs(i - j)
+
+    stronger = stronger_cue_index(i, j)
+    weaker = weaker_cue_index(i, j)
+
+    # 测试：固定呈现 (强, 弱) = (小编号, 大编号)，如 [0, 7]
+    # 学习：可随机交换左右，使 teacher_da 随「赢家在哪侧」变化
+    if phase == "learn" and config.learn_shuffle_presentation:
+        if np.random.random() < 0.5:
+            display_pair = [weaker, stronger]
+        else:
+            display_pair = [stronger, weaker]
+    else:
+        display_pair = [stronger, weaker]
 
     for batch_index in range(config.bs):
-        # 旧版：随机采样 trial pair
-        # cue_pair = sample_trial_pair(
-        #     nbcues, nbtrials[batch_index] < config.nbtraintrials
-        # )
-        # assert nbtrials[batch_index] == int(nbtrials[batch_index])
-
-        correct_order[batch_index] = 1 if pair[0] < pair[1] else 0
-        adjacent[batch_index] = 1 if abs(pair[0] - pair[1]) == 1 else 0
-        cue_pairs.append(list(pair))
+        stim1_is_stronger = display_pair[0] == stronger
+        # 1 → 应选 stim1（action 1）；0 → 应选 stim2（action 0）
+        correct_order[batch_index] = 1 if stim1_is_stronger else 0
+        adjacent[batch_index] = 1 if abs(i - j) == 1 else 0
+        cue_pairs.append(list(display_pair))
+        teacher_signal[batch_index] = 1.0 if stim1_is_stronger else -1.0
         if phase == "learn":
-            # 观察学习：只呈现约束，无 Go 信号
-            cues.append([pair, -1, -1, -1])
+            cues.append([display_pair, -1, -1, -1])
         else:
-            # 测试：呈现查询 + Go 信号
-            cues.append([pair, nbcues, -1, -1])
-        # 旧版：学习/测试统一 cues 序列
-        # cues.append([cue_pair, nbcues, -1, -1])
+            cues.append([display_pair, nbcues, -1, -1])
 
-    return cues, cue_pairs, correct_order, adjacent, delta
+    return cues, cue_pairs, correct_order, adjacent, delta, teacher_signal
 
 
-def compute_trial_loss(config, trial_rewards, trial_values, trial_logprobs, bent, triallen):
+def compute_trial_loss(
+    config, trial_rewards, trial_values, trial_logprobs, bent, triallen, aux_loss=None
+):
     """
-    单个 trial 内的损失（bent + 价值预测 + 策略梯度占位）。
+    单个 trial 内的损失（bent + 价值预测 + 策略梯度占位 + 可选辅助 CE）。
     配合 trial 末 pw.detach()，避免 1184 步整图反传导致 OOM。
     """
     loss = bent
@@ -453,7 +480,7 @@ def compute_trial_loss(config, trial_rewards, trial_values, trial_logprobs, bent
         ).to(DEVICE)
         advantage = bootstrap_return - trial_values[step_idx][:, 0]
         lossv = lossv + advantage.pow(2).sum() / config.bs
-        loss_multiplier = 0.0  # 观察学习 / 测试无反馈：策略梯度关闭
+        loss_multiplier = 0.0  # 行为无 reward 反馈；策略梯度仍关闭
         loss = (
             loss
             - loss_multiplier
@@ -461,6 +488,8 @@ def compute_trial_loss(config, trial_rewards, trial_values, trial_logprobs, bent
             / config.bs
         )
     loss = loss + config.blossv * lossv
+    if aux_loss is not None:
+        loss = loss + aux_loss
     return loss / triallen
 
 
@@ -495,8 +524,9 @@ def run_single_trial(
     trial_values = []
     trial_logprobs = []
     bent = torch.tensor(0.0, device=DEVICE)
+    trial_aux_loss = torch.tensor(0.0, device=DEVICE)
 
-    cues, cue_pairs, correct_order, adjacent, delta = prepare_trial(
+    cues, cue_pairs, correct_order, adjacent, delta, teacher_signal = prepare_trial(
         config, nbcues, scheduled_pair, phase
     )
     istest_thisep[:, global_trial_idx] = 1 if phase == "test" else 0
@@ -521,8 +551,7 @@ def run_single_trial(
 
         teacher_da = None
         if phase == "learn":
-            # 观察学习：用真实相对顺序作为教师多巴胺，驱动 pw 更新
-            teacher_signal = np.where(correct_order, 1.0, -1.0).astype(np.float32)
+            # 观察学习：stim1 为更强项 → +1，否则 -1（配合随机左右呈现）
             teacher_da = torch.from_numpy(teacher_signal).to(DEVICE).view(config.bs, 1)
 
         y_raw, value, daout, hidden, et, pw = net(
@@ -539,6 +568,19 @@ def run_single_trial(
             trial_logprobs.append(torch.zeros(config.bs, device=DEVICE))
             previous_actions = np.zeros(config.bs, dtype=np.int32)
             y = torch.softmax(y_raw, dim=1)
+
+        if compute_loss:
+            target = torch.from_numpy(correct_order.astype(np.int64)).to(DEVICE)
+            if phase == "learn" and numstep == 0 and config.baux_learn > 0:
+                # pair 呈现步：离线预测更强的一侧（action 1 = stim1）
+                trial_aux_loss = trial_aux_loss + config.baux_learn * nn.functional.cross_entropy(
+                    y_raw, target
+                )
+            if phase == "test" and numstep == NUMRESPONSESTEP and config.baux_test > 0:
+                # 决策步：离线 CE，行为仍无 reward 反馈
+                trial_aux_loss = trial_aux_loss + config.baux_test * nn.functional.cross_entropy(
+                    y_raw, target
+                )
 
         if print_trace:
             log_trace(
@@ -559,9 +601,9 @@ def run_single_trial(
         for batch_index in range(config.bs):
             if phase == "test" and numstep == NUMRESPONSESTEP:
                 correct_answer[batch_index] = 1
-                chose_item_1 = previous_actions[batch_index] == 1
-                if (correct_order[batch_index] and chose_item_1) or (
-                    (not correct_order[batch_index]) and not chose_item_1
+                chose_stim1 = previous_actions[batch_index] == 1
+                if (correct_order[batch_index] and chose_stim1) or (
+                    (not correct_order[batch_index]) and not chose_stim1
                 ):
                     # 测试无反馈：记录正确性，但不给 reward
                     pass
@@ -610,7 +652,13 @@ def run_single_trial(
     trial_loss = None
     if compute_loss:
         trial_loss = compute_trial_loss(
-            config, trial_rewards, trial_values, trial_logprobs, bent, triallen
+            config,
+            trial_rewards,
+            trial_values,
+            trial_logprobs,
+            bent,
+            triallen,
+            aux_loss=trial_aux_loss,
         )
         trial_loss = trial_loss + config.lpw * torch.mean(pw**2) / config.nbtrials
 
@@ -839,7 +887,7 @@ def run_episode_eval(config, net, nbcues, print_trace=False):
         supervision_set=state["supervision_set"],
         query_set=state["query_set"],
         test_responses=state["test_responses"],
-        true_rank=list(range(nbcues)),
+        true_rank=default_true_rank(nbcues),
         test_perf=test_perf,
         test_perf_adjacent=test_perf_adjacent,
         test_perf_nonadjacent=test_perf_nonadjacent,
@@ -927,6 +975,8 @@ def train(config, output_dir, trace_steps=False):
     log(
         f"[setup] Batch size: {config.bs}; episodes: {config.nbiter}; "
         f"learn_blocks: {config.nb_learn_blocks}; test_blocks: {config.nb_test_blocks}; "
+        f"baux_learn={config.baux_learn}; baux_test={config.baux_test}; "
+        f"learn_shuffle={config.learn_shuffle_presentation}; "
         f"output: {output_dir}"
     )
     log(f"[setup] Parameter shapes: {[x.size() for x in net.parameters()]}")
@@ -1033,6 +1083,23 @@ def parse_args():
         help="训练时每次 save checkpoint 后运行分析",
     )
     parser.add_argument(
+        "--no-learn-shuffle",
+        action="store_true",
+        help="学习阶段不随机交换左右呈现（关闭有符号 teacher_da）",
+    )
+    parser.add_argument(
+        "--baux-learn",
+        type=float,
+        default=0.5,
+        help="学习 pair 呈现步离线 CE 权重（meta-train）",
+    )
+    parser.add_argument(
+        "--baux-test",
+        type=float,
+        default=1.0,
+        help="测试决策步离线 CE 权重（meta-train；行为仍无反馈）",
+    )
+    parser.add_argument(
         "--trace-steps",
         action="store_true",
         help="Print per-step debugging details on summary episodes.",
@@ -1053,6 +1120,9 @@ def main():
         nb_test_blocks=args.test_blocks,
         supervision_size=args.supervision_size,
         analyze_on_save=args.analyze_on_save,
+        learn_shuffle_presentation=not args.no_learn_shuffle,
+        baux_learn=args.baux_learn,
+        baux_test=args.baux_test,
     )
     np.set_printoptions(precision=5)
     set_seed(config.rngseed)

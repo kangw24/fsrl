@@ -53,7 +53,24 @@ class AnalysisReport:
         data = asdict(self)
         data["response_matrix"] = self.response_matrix.tolist()
         data["subjective_scores"] = self.subjective_scores.tolist()
-        return data
+        return _json_sanitize(data)
+
+
+def _json_sanitize(obj):
+    """把 numpy 标量/数组递归转为原生 Python 类型，供 json.dump 使用。"""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, dict):
+        return {k: _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_sanitize(v) for v in obj]
+    return obj
 
 
 def canonical_pair(i: int, j: int) -> tuple[int, int]:
