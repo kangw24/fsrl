@@ -69,6 +69,11 @@ class TrainConfig:
     pw_init_std: float = 0.0  # >0 时每 episode 为各 batch 采样 N(0, std) 初始 pw
     persistent_pw: bool = False  # True 时 batch_index 跨 episode 保留 pw（虚拟被试）
     pw_episode_jitter: float = 0.0  # 每 episode 初在 pw 上加 N(0, jitter) 扰动
+    # 建构性排序（Liu 2026 constructive ranking）：每被试私有 rank 向量
+    use_constructive_rank: bool = False
+    construct_rank_lr: float = 0.3  # 学习 trial 末 rank 更新步长
+    construct_rank_init_std: float = 0.1  # episode 初 rank ~ N(0, std)
+    construct_rank_mix: float = 1.0  # 测试决策：1=纯 rank，0=纯 net 采样
 
     @property
     def nbcuesrange(self):
@@ -259,6 +264,7 @@ class EpisodeStats:
     test_perf_adjacent: float | None
     test_perf_nonadjacent: float | None
     final_pw: torch.Tensor
+    final_subject_rank: torch.Tensor | None = None
 
 
 @dataclass
@@ -314,6 +320,150 @@ def init_subject_pw(config, net):
             config.bs, config.hs, config.hs, device=DEVICE
         )
     return net.initialZeroPlasticWeights(config.bs)
+
+
+def init_subject_rank(config) -> torch.Tensor | None:
+    """persistent_pw + constructive rank 时，跨 episode 保留的私有 rank 初态。"""
+    if not config.use_constructive_rank:
+        return None
+    if config.construct_rank_init_std > 0:
+        return config.construct_rank_init_std * torch.randn(
+            config.bs, config.nbcues, device=DEVICE
+        )
+    return torch.zeros(config.bs, config.nbcues, device=DEVICE)
+
+
+def resolve_episode_construct_rank(config, subject_rank=None) -> torch.Tensor | None:
+    """决定本 episode 各 batch 的起始私有 rank。"""
+    if not config.use_constructive_rank:
+        return None
+    if config.persistent_pw and subject_rank is not None:
+        return subject_rank.detach().clone()
+    return init_subject_rank(config)
+
+
+def update_constructive_rank(rank, cue_pairs, teacher_signal, delta, config) -> None:
+    """学习 trial 末：按呈现顺序与 teacher 信号更新私有 rank。"""
+    if rank is None:
+        return
+    step = float(config.construct_rank_lr)
+    if config.nbcues > 1 and delta > 0:
+        step *= 1.0 + float(delta) / (config.nbcues - 1)
+    stim1 = torch.tensor([p[0] for p in cue_pairs], device=rank.device, dtype=torch.long)
+    stim2 = torch.tensor([p[1] for p in cue_pairs], device=rank.device, dtype=torch.long)
+    sign = torch.from_numpy(teacher_signal).to(rank.device)
+    batch_idx = torch.arange(rank.shape[0], device=rank.device)
+    rank[batch_idx, stim1] = rank[batch_idx, stim1] + step * sign
+    rank[batch_idx, stim2] = rank[batch_idx, stim2] - step * sign
+
+
+def sample_constructive_actions(rank, cue_pairs, y_probs, config) -> np.ndarray:
+    """测试决策：默认比较 rank[stim1] vs rank[stim2]。"""
+    actions = np.zeros(config.bs, dtype=np.int32)
+    mix = float(config.construct_rank_mix)
+    for batch_index in range(config.bs):
+        stim1, stim2 = int(cue_pairs[batch_index][0]), int(cue_pairs[batch_index][1])
+        rank_diff = float(rank[batch_index, stim1] - rank[batch_index, stim2])
+        if mix >= 1.0:
+            actions[batch_index] = 1 if rank_diff > 0 else 0
+        else:
+            rank_p = torch.sigmoid(
+                torch.tensor(rank_diff, device=rank.device)
+            ).item()
+            net_p = float(y_probs[batch_index, 1])
+            p = mix * rank_p + (1.0 - mix) * net_p
+            actions[batch_index] = 1 if np.random.random() < p else 0
+    return actions
+
+
+def subject_rank_paths(output_dir: Path, rngseed: int) -> list[Path]:
+    output_dir = Path(output_dir)
+    paths = [output_dir / "subject_rank.pt"]
+    if rngseed >= 0:
+        paths.append(output_dir / f"subject_rankAE{rngseed}.pt")
+    return paths
+
+
+def save_subject_rank(output_dir: Path, config, subject_rank: torch.Tensor) -> None:
+    if subject_rank is None or not config.use_constructive_rank:
+        return
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "subject_rank": subject_rank.detach().cpu(),
+        "train_bs": int(config.bs),
+        "nbcues": int(config.nbcues),
+        "rngseed": int(config.rngseed),
+        "construct_rank_init_std": float(config.construct_rank_init_std),
+        "use_constructive_rank": True,
+    }
+    for path in subject_rank_paths(output_dir, config.rngseed):
+        torch.save(payload, path)
+    log(f"[save] subject_rank shape={tuple(subject_rank.shape)} → {output_dir}")
+
+
+def resolve_subject_rank_path(model_path=None, subject_rank_path=None) -> Path | None:
+    if subject_rank_path:
+        path = Path(subject_rank_path)
+        return path if path.is_absolute() else ROOT_DIR / path
+    if model_path:
+        model = resolve_model_path(model_path)
+        candidate = model.parent / "subject_rank.pt"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_subject_rank(path: Path, config) -> torch.Tensor:
+    payload = _load_torch_payload(path)
+    if isinstance(payload, dict):
+        rank = payload["subject_rank"].to(DEVICE)
+        train_bs = int(payload.get("train_bs", rank.shape[0]))
+        saved_nbcues = int(payload.get("nbcues", rank.shape[1]))
+    else:
+        rank = payload.to(DEVICE)
+        train_bs = rank.shape[0]
+        saved_nbcues = rank.shape[1]
+    if saved_nbcues != config.nbcues:
+        raise ValueError(
+            f"subject_rank nbcues={saved_nbcues} 与当前 nbcues={config.nbcues} 不一致: {path}"
+        )
+    eval_bs = config.bs
+    if eval_bs == train_bs:
+        return rank
+    if eval_bs < train_bs:
+        log(f"[subject_rank] eval bs={eval_bs} < train bs={train_bs}，使用前 {eval_bs} 个被试")
+        return rank[:eval_bs].clone()
+    # pad with fresh init
+    if config.construct_rank_init_std > 0:
+        pad = config.construct_rank_init_std * torch.randn(
+            eval_bs - train_bs, config.nbcues, device=DEVICE
+        )
+    else:
+        pad = torch.zeros(eval_bs - train_bs, config.nbcues, device=DEVICE)
+    log(
+        f"[subject_rank] eval bs={eval_bs} > train bs={train_bs}，"
+        f"额外 {eval_bs - train_bs} 个槽位使用新初值"
+    )
+    return torch.cat([rank, pad], dim=0)
+
+
+def prepare_eval_subject_rank(
+    config, model_path=None, subject_rank_path=None
+) -> torch.Tensor | None:
+    if not config.use_constructive_rank:
+        return None
+    path = resolve_subject_rank_path(model_path, subject_rank_path)
+    if path is not None:
+        if not path.exists():
+            raise FileNotFoundError(f"未找到 subject_rank 文件: {path}")
+        rank = load_subject_rank(path, config)
+        log(f"[subject_rank] 已加载 {path} (shape={tuple(rank.shape)})")
+        return rank
+    if config.persistent_pw:
+        log("[subject_rank] 未找到 checkpoint，使用 init_subject_rank()")
+        return init_subject_rank(config)
+    return None
 
 
 def subject_pw_paths(output_dir: Path, rngseed: int) -> list[Path]:
@@ -657,6 +807,7 @@ def run_single_trial(
     test_responses=None,
     block_id=None,
     compute_loss=False,
+    construct_rank=None,
 ):
     """执行单个 trial（学习或测试），并记录逐步状态。"""
     triallen = config.learn_triallen if phase == "learn" else config.test_triallen
@@ -705,10 +856,24 @@ def run_single_trial(
 
         if phase == "test":
             y = torch.softmax(y_raw, dim=1)
-            distrib = torch.distributions.Categorical(y)
-            actions = distrib.sample()
-            trial_logprobs.append(distrib.log_prob(actions))
-            previous_actions = actions.detach().cpu().numpy()
+            if construct_rank is not None and config.construct_rank_mix > 0:
+                if numstep == NUMRESPONSESTEP:
+                    actions_np = sample_constructive_actions(
+                        construct_rank,
+                        cue_pairs,
+                        y.detach().cpu().numpy(),
+                        config,
+                    )
+                    actions = torch.from_numpy(actions_np).to(DEVICE)
+                else:
+                    actions = torch.zeros(config.bs, dtype=torch.long, device=DEVICE)
+                trial_logprobs.append(torch.zeros(config.bs, device=DEVICE))
+                previous_actions = actions.detach().cpu().numpy()
+            else:
+                distrib = torch.distributions.Categorical(y)
+                actions = distrib.sample()
+                trial_logprobs.append(distrib.log_prob(actions))
+                previous_actions = actions.detach().cpu().numpy()
         else:
             trial_logprobs.append(torch.zeros(config.bs, device=DEVICE))
             previous_actions = np.zeros(config.bs, dtype=np.int32)
@@ -794,6 +959,11 @@ def run_single_trial(
         bent = bent + config.bent * y.pow(2).sum() / config.bs
         numstep_ep += 1
 
+    if phase == "learn" and construct_rank is not None:
+        update_constructive_rank(
+            construct_rank, cue_pairs, teacher_signal, delta, config
+        )
+
     trial_loss = None
     if compute_loss:
         trial_loss = compute_trial_loss(
@@ -833,6 +1003,7 @@ def _run_episode_blocks(
     collect_responses=False,
     training=False,
     initial_pw=None,
+    initial_subject_rank=None,
 ):
     """
     执行 episode 的学习 + 测试 block 循环（训练与 eval 共用）。
@@ -844,6 +1015,7 @@ def _run_episode_blocks(
         pw = initial_pw.detach().clone()
     else:
         pw = net.initialZeroPlasticWeights(config.bs)
+    construct_rank = resolve_episode_construct_rank(config, initial_subject_rank)
     cue_data = generate_cue_data(config, nbcues)
 
     test_responses = [] if collect_responses else None
@@ -893,6 +1065,7 @@ def _run_episode_blocks(
             test_responses=test_responses,
             block_id=block_id,
             compute_loss=training,
+            construct_rank=construct_rank,
         )
         if training and trial_loss is not None:
             scaled = trial_loss / config.nbtrials
@@ -915,13 +1088,14 @@ def _run_episode_blocks(
         "loss_sum": loss_sum,
         "test_counters": test_counters,
         "pw": pw,
+        "construct_rank": construct_rank,
         "supervision_set": supervision_set,
         "query_set": query_set,
         "test_responses": test_responses or [],
     }
 
 
-def run_episode(config, net, nbcues, print_trace=False, subject_pw=None):
+def run_episode(config, net, nbcues, print_trace=False, subject_pw=None, subject_rank=None):
     """运行完整 episode：学习 blocks + 测试 blocks；按 trial 反传，返回损失统计。"""
     initial_pw = resolve_episode_pw(config, net, subject_pw)
     state = _run_episode_blocks(
@@ -932,9 +1106,11 @@ def run_episode(config, net, nbcues, print_trace=False, subject_pw=None):
         collect_responses=False,
         training=True,
         initial_pw=initial_pw,
+        initial_subject_rank=subject_rank,
     )
 
     pw = state["pw"]
+    construct_rank = state["construct_rank"]
     test_counters = state["test_counters"]
     loss_sum = state["loss_sum"]
     loss_value = loss_sum / max(config.nbtrials, 1)
@@ -969,6 +1145,9 @@ def run_episode(config, net, nbcues, print_trace=False, subject_pw=None):
         test_perf_adjacent=test_perf_adjacent,
         test_perf_nonadjacent=test_perf_nonadjacent,
         final_pw=pw.detach(),
+        final_subject_rank=(
+            construct_rank.detach() if construct_rank is not None else None
+        ),
     )
 
 
@@ -1005,7 +1184,9 @@ def load_network(config, model_path=None):
     return net
 
 
-def run_episode_eval(config, net, nbcues, print_trace=False, subject_pw=None):
+def run_episode_eval(
+    config, net, nbcues, print_trace=False, subject_pw=None, subject_rank=None
+):
     """
     运行 eval episode 并采集 EpisodeRecord（供分析环节使用）。
     不计算训练 loss，不反传梯度。
@@ -1020,6 +1201,7 @@ def run_episode_eval(config, net, nbcues, print_trace=False, subject_pw=None):
         print_trace=print_trace,
         collect_responses=True,
         initial_pw=initial_pw,
+        initial_subject_rank=subject_rank,
     )
     test_counters = state["test_counters"]
     nbtesttrials = test_counters["nbtesttrials"]
@@ -1110,7 +1292,7 @@ def print_episode_summary(config, episode_index, stats, start_time):
     log(f"mean-abs pw: {float(torch.mean(torch.abs(pw))):.6f}")
 
 
-def save_checkpoint(config, net, output_dir, test_rewards, subject_pw=None):
+def save_checkpoint(config, net, output_dir, test_rewards, subject_pw=None, subject_rank=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(net.state_dict(), output_dir / ("netAE" + str(config.rngseed) + ".dat"))
     torch.save(net.state_dict(), output_dir / "net.dat")
@@ -1119,6 +1301,8 @@ def save_checkpoint(config, net, output_dir, test_rewards, subject_pw=None):
             thefile.write(f"{item}\n")
     if subject_pw is not None and config.persistent_pw:
         save_subject_pw(output_dir, config, subject_pw)
+    if subject_rank is not None and config.use_constructive_rank:
+        save_subject_rank(output_dir, config, subject_rank)
     log(f"[save] Wrote checkpoint and test-reward log to {output_dir}")
 
 
@@ -1141,11 +1325,20 @@ def train(config, output_dir, trace_steps=False):
         f"learn_shuffle={config.learn_shuffle_presentation}; warmup={config.warmup}; "
         f"pw_init_std={config.pw_init_std}; persistent_pw={config.persistent_pw}; "
         f"pw_episode_jitter={config.pw_episode_jitter}; "
+        f"use_constructive_rank={config.use_constructive_rank}; "
+        f"construct_rank_lr={config.construct_rank_lr}; "
+        f"construct_rank_init_std={config.construct_rank_init_std}; "
+        f"construct_rank_mix={config.construct_rank_mix}; "
         f"output: {output_dir}"
     )
     log(f"[setup] Parameter shapes: {[x.size() for x in net.parameters()]}")
 
     subject_pw = init_subject_pw(config, net) if config.persistent_pw else None
+    subject_rank = (
+        init_subject_rank(config)
+        if config.use_constructive_rank and config.persistent_pw
+        else None
+    )
 
     trace_start = time.time()
     episode_iter = tqdm(
@@ -1162,10 +1355,17 @@ def train(config, output_dir, trace_steps=False):
 
         optimizer.zero_grad()
         stats = run_episode(
-            config, net, nbcues=nbcues, print_trace=print_trace, subject_pw=subject_pw
+            config,
+            net,
+            nbcues=nbcues,
+            print_trace=print_trace,
+            subject_pw=subject_pw,
+            subject_rank=subject_rank,
         )
         if config.persistent_pw:
             subject_pw = stats.final_pw.detach()
+        if config.use_constructive_rank and config.persistent_pw:
+            subject_rank = stats.final_subject_rank.detach()
         # 梯度已在 run_episode 内按 trial 累积反传
         torch.nn.utils.clip_grad_norm_(net.parameters(), config.gc)
         if episode_index > config.warmup:
@@ -1178,7 +1378,12 @@ def train(config, output_dir, trace_steps=False):
 
         if episode_index % config.save_every == 0 and episode_index > 0:
             save_checkpoint(
-                config, net, output_dir, test_rewards, subject_pw=subject_pw
+                config,
+                net,
+                output_dir,
+                test_rewards,
+                subject_pw=subject_pw,
+                subject_rank=subject_rank,
             )
             if config.analyze_on_save:
                 _run_analysis_checkpoint(
@@ -1186,16 +1391,24 @@ def train(config, output_dir, trace_steps=False):
                     net,
                     output_dir / "analysis",
                     subject_pw=subject_pw,
+                    subject_rank=subject_rank,
                     model_path=output_dir / "net.dat",
                 )
 
-    save_checkpoint(config, net, output_dir, test_rewards, subject_pw=subject_pw)
+    save_checkpoint(
+        config,
+        net,
+        output_dir,
+        test_rewards,
+        subject_pw=subject_pw,
+        subject_rank=subject_rank,
+    )
 
     return net
 
 
 def _run_analysis_checkpoint(
-    config, net, analysis_dir, subject_pw=None, model_path=None
+    config, net, analysis_dir, subject_pw=None, subject_rank=None, model_path=None
 ):
     """训练过程中 checkpoint 时运行分析（可选）。"""
     from analysis import run_full_analysis
@@ -1204,11 +1417,24 @@ def _run_analysis_checkpoint(
     eval_pw = subject_pw
     if eval_pw is None:
         eval_pw = prepare_eval_subject_pw(config, net, model_path=model_path)
-    record = run_episode_eval(config, net, nbcues=config.nbcues, subject_pw=eval_pw)
+    eval_rank = subject_rank
+    if eval_rank is None:
+        eval_rank = prepare_eval_subject_rank(
+            config, model_path=model_path
+        )
+    record = run_episode_eval(
+        config,
+        net,
+        nbcues=config.nbcues,
+        subject_pw=eval_pw,
+        subject_rank=eval_rank,
+    )
     run_full_analysis(record, analysis_dir)
 
 
-def run_analyze_mode(config, model_path, analysis_dir, subject_pw_path=None):
+def run_analyze_mode(
+    config, model_path, analysis_dir, subject_pw_path=None, subject_rank_path=None
+):
     """仅运行 eval + 分析（--analyze 模式）。"""
     from analysis import run_full_analysis
 
@@ -1217,13 +1443,21 @@ def run_analyze_mode(config, model_path, analysis_dir, subject_pw_path=None):
     log(
         f"[analyze] batch={config.bs}, learn_blocks={config.nb_learn_blocks}, "
         f"test_blocks={config.nb_test_blocks}, |S|={config.supervision_size}; "
-        f"pw_init_std={config.pw_init_std}, persistent_pw={config.persistent_pw}"
+        f"pw_init_std={config.pw_init_std}, persistent_pw={config.persistent_pw}; "
+        f"use_constructive_rank={config.use_constructive_rank}"
     )
     subject_pw = prepare_eval_subject_pw(
         config, net, model_path=model_path, subject_pw_path=subject_pw_path
     )
+    subject_rank = prepare_eval_subject_rank(
+        config, model_path=model_path, subject_rank_path=subject_rank_path
+    )
     record = run_episode_eval(
-        config, net, nbcues=config.nbcues, subject_pw=subject_pw
+        config,
+        net,
+        nbcues=config.nbcues,
+        subject_pw=subject_pw,
+        subject_rank=subject_rank,
     )
     report = run_full_analysis(record, analysis_dir)
     log(f"[analyze] 主观排序: {report.subjective_rank}")
@@ -1337,7 +1571,57 @@ def parse_args():
             "pw_init_std=0.08（可被显式 CLI 参数覆盖）"
         ),
     )
+    parser.add_argument(
+        "--use-constructive-rank",
+        action="store_true",
+        help="启用每被试私有 rank 向量（建构性排序；测试决策由 rank 驱动）",
+    )
+    parser.add_argument(
+        "--construct-rank-lr",
+        type=float,
+        default=0.3,
+        help="学习 trial 末 rank 更新步长",
+    )
+    parser.add_argument(
+        "--construct-rank-init-std",
+        type=float,
+        default=0.1,
+        help="episode 初 rank ~ N(0, std)",
+    )
+    parser.add_argument(
+        "--construct-rank-mix",
+        type=float,
+        default=1.0,
+        help="测试决策：1=纯 rank，0=纯 net 采样",
+    )
+    parser.add_argument(
+        "--construct-preset",
+        action="store_true",
+        help=(
+            "Route C 预设：use_constructive_rank, persistent_pw, baux_learn=0.5, "
+            "baux_test=0, pw_init_std=0.05, construct_rank_init_std=0.15"
+        ),
+    )
+    parser.add_argument(
+        "--subject-rank-path",
+        default=None,
+        help="分析时加载的 subject_rank.pt（默认与 --model-path 同目录）",
+    )
     return parser.parse_args()
+
+
+def apply_construct_preset(args):
+    """Route C：建构性排序训练预设。"""
+    if not args.construct_preset:
+        return args
+    args.use_constructive_rank = True
+    args.persistent_pw = True
+    args.baux_learn = 0.5
+    args.baux_test = 0.0
+    if args.pw_init_std == 0.0:
+        args.pw_init_std = 0.05
+    args.construct_rank_init_std = 0.15
+    return args
 
 
 def apply_liu_minimal_preset(args):
@@ -1355,6 +1639,7 @@ def apply_liu_minimal_preset(args):
 def main():
     args = parse_args()
     args = apply_liu_minimal_preset(args)
+    args = apply_construct_preset(args)
     config = TrainConfig(
         rngseed=args.seed,
         bs=args.batch_size,
@@ -1374,6 +1659,10 @@ def main():
         pw_init_std=args.pw_init_std,
         persistent_pw=args.persistent_pw,
         pw_episode_jitter=args.pw_episode_jitter,
+        use_constructive_rank=args.use_constructive_rank,
+        construct_rank_lr=args.construct_rank_lr,
+        construct_rank_init_std=args.construct_rank_init_std,
+        construct_rank_mix=args.construct_rank_mix,
     )
     np.set_printoptions(precision=5)
     set_seed(config.rngseed)
@@ -1381,6 +1670,8 @@ def main():
     output_dir = Path(args.output_dir)
     if args.liu_minimal and str(output_dir) == str(ROOT_DIR):
         output_dir = ROOT_DIR / "liu_minimal"
+    if args.construct_preset and str(output_dir) == str(ROOT_DIR):
+        output_dir = ROOT_DIR / "new_construct"
     if args.analyze:
         analysis_dir = (
             Path(args.analysis_dir) if args.analysis_dir else output_dir / "analysis"
@@ -1390,6 +1681,7 @@ def main():
             args.model_path,
             analysis_dir,
             subject_pw_path=args.subject_pw_path,
+            subject_rank_path=args.subject_rank_path,
         )
         return
 
@@ -1397,6 +1689,13 @@ def main():
         log(
             "[liu-minimal] baux_learn=0, baux_test=0, persistent_pw=True, "
             f"pw_init_std={config.pw_init_std}"
+        )
+    if args.construct_preset:
+        log(
+            "[construct-preset] use_constructive_rank=True, persistent_pw=True, "
+            f"baux_learn={config.baux_learn}, baux_test={config.baux_test}, "
+            f"pw_init_std={config.pw_init_std}, "
+            f"construct_rank_init_std={config.construct_rank_init_std}"
         )
     train(config, output_dir, trace_steps=args.trace_steps)
 

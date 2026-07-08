@@ -54,6 +54,28 @@ def main():
         action="store_true",
         help="分析时假定 persistent_pw；无 subject_pw 时 pw_init_std=0.08",
     )
+    ap.add_argument(
+        "--use-constructive-rank",
+        action="store_true",
+        help="分析时启用建构性 rank 决策（需 subject_rank.pt 或 persistent 初值）",
+    )
+    ap.add_argument(
+        "--construct-rank-init-std",
+        type=float,
+        default=0.1,
+        help="无 subject_rank.pt 时的 rank 初值 std",
+    )
+    ap.add_argument(
+        "--construct-rank-mix",
+        type=float,
+        default=1.0,
+        help="测试决策：1=纯 rank，0=纯 net 采样",
+    )
+    ap.add_argument(
+        "--subject-rank-path",
+        default=None,
+        help="subject_rank.pt（默认与 --model-path 同目录自动查找）",
+    )
     args = ap.parse_args()
 
     if args.liu_minimal:
@@ -71,6 +93,9 @@ def main():
         pw_init_std=args.pw_init_std,
         persistent_pw=args.persistent_pw,
         pw_episode_jitter=args.pw_episode_jitter,
+        use_constructive_rank=args.use_constructive_rank,
+        construct_rank_init_std=args.construct_rank_init_std,
+        construct_rank_mix=args.construct_rank_mix,
     )
     set_seed(config.rngseed)
 
@@ -81,6 +106,7 @@ def main():
         args.model_path,
         analysis_dir,
         subject_pw_path=args.subject_pw_path,
+        subject_rank_path=args.subject_rank_path,
     )
 
 
