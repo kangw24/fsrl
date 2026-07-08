@@ -1,8 +1,8 @@
 """
 Readable training script for the plastic RNN transitive-inference task.
 
-This file keeps the learning rule, task structure, and saved model format of
-``simple.py`` while organizing the code into small functions for learning.
+Experimental branch (see ``simple_neo.py`` for the stable original).
+Adds cross-subject plastic-weight variation: random / persistent ``pw`` per batch slot.
 """
 
 import argparse
@@ -65,6 +65,10 @@ class TrainConfig:
     baux_learn: float = 0.5  # 学习阶段 pair 呈现步的 CE
     baux_test: float = 1.0  # 测试决策步的 CE
     warmup: int = 100  # episode 0…warmup 不 step（论文默认）；-1 表示从 ep0 起每轮更新
+    # 跨被试可塑初态（Liu 2026 个体差异）
+    pw_init_std: float = 0.0  # >0 时每 episode 为各 batch 采样 N(0, std) 初始 pw
+    persistent_pw: bool = False  # True 时 batch_index 跨 episode 保留 pw（虚拟被试）
+    pw_episode_jitter: float = 0.0  # 每 episode 初在 pw 上加 N(0, jitter) 扰动
 
     @property
     def nbcuesrange(self):
@@ -281,6 +285,144 @@ class EpisodeRecord:
     test_perf: float | None = None
     test_perf_adjacent: float | None = None
     test_perf_nonadjacent: float | None = None
+
+
+def resolve_episode_pw(config, net, subject_pw=None):
+    """
+    决定本 episode 各 batch 元素的起始可塑权重 pw。
+    persistent_pw 时沿用 subject_pw；否则按 pw_init_std 随机或置零。
+    """
+    hs = config.hs
+    if config.persistent_pw and subject_pw is not None:
+        pw = subject_pw.detach().clone()
+    elif config.pw_init_std > 0:
+        pw = config.pw_init_std * torch.randn(config.bs, hs, hs, device=DEVICE)
+    else:
+        pw = net.initialZeroPlasticWeights(config.bs)
+
+    if config.pw_episode_jitter > 0 and (
+        config.persistent_pw or config.pw_init_std > 0
+    ):
+        pw = pw + config.pw_episode_jitter * torch.randn_like(pw)
+    return pw
+
+
+def init_subject_pw(config, net):
+    """persistent_pw 模式下，首个 episode 之前的被试级 pw 初值。"""
+    if config.pw_init_std > 0:
+        return config.pw_init_std * torch.randn(
+            config.bs, config.hs, config.hs, device=DEVICE
+        )
+    return net.initialZeroPlasticWeights(config.bs)
+
+
+def subject_pw_paths(output_dir: Path, rngseed: int) -> list[Path]:
+    """checkpoint 旁 subject_pw 文件路径（与 net.dat / netAE 命名对齐）。"""
+    output_dir = Path(output_dir)
+    paths = [output_dir / "subject_pw.pt"]
+    if rngseed >= 0:
+        paths.append(output_dir / f"subject_pwAE{rngseed}.pt")
+    return paths
+
+
+def save_subject_pw(output_dir: Path, config, subject_pw: torch.Tensor) -> None:
+    """保存训练末各 batch 槽位的可塑慢权重（虚拟被试状态）。"""
+    if subject_pw is None:
+        return
+    payload = {
+        "subject_pw": subject_pw.detach().cpu(),
+        "train_bs": int(config.bs),
+        "hs": int(config.hs),
+        "rngseed": int(config.rngseed),
+        "pw_init_std": float(config.pw_init_std),
+        "persistent_pw": bool(config.persistent_pw),
+    }
+    for path in subject_pw_paths(output_dir, config.rngseed):
+        torch.save(payload, path)
+    log(
+        f"[save] subject_pw shape={tuple(subject_pw.shape)} → "
+        f"{subject_pw_paths(output_dir, config.rngseed)[0].parent}"
+    )
+
+
+def resolve_subject_pw_path(model_path=None, subject_pw_path=None) -> Path | None:
+    """解析 subject_pw 文件；未指定时尝试与 model 同目录的 subject_pw.pt。"""
+    if subject_pw_path:
+        path = Path(subject_pw_path)
+        return path if path.is_absolute() else ROOT_DIR / path
+    if model_path:
+        model = resolve_model_path(model_path)
+        candidate = model.parent / "subject_pw.pt"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_torch_payload(path: Path):
+    try:
+        return torch.load(path, map_location=DEVICE, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=DEVICE)
+
+
+def _pad_subject_pw(pw: torch.Tensor, eval_bs: int, config, net) -> torch.Tensor:
+    """eval batch 大于训练 batch 时，用新被试初值填充额外槽位。"""
+    train_bs = pw.shape[0]
+    n_pad = eval_bs - train_bs
+    if config.pw_init_std > 0:
+        pad = config.pw_init_std * torch.randn(n_pad, config.hs, config.hs, device=DEVICE)
+    else:
+        pad = net.initialZeroPlasticWeights(n_pad)
+    log(
+        f"[subject_pw] eval bs={eval_bs} > train bs={train_bs}，"
+        f"额外 {n_pad} 个槽位使用新初值（非训练轨迹）"
+    )
+    return torch.cat([pw, pad], dim=0)
+
+
+def load_subject_pw(path: Path, config, net) -> torch.Tensor:
+    """加载 subject_pw 并适配 eval batch size。"""
+    payload = _load_torch_payload(path)
+    if isinstance(payload, dict):
+        pw = payload["subject_pw"].to(DEVICE)
+        train_bs = int(payload.get("train_bs", pw.shape[0]))
+        saved_hs = int(payload.get("hs", pw.shape[1]))
+    else:
+        pw = payload.to(DEVICE)
+        train_bs = pw.shape[0]
+        saved_hs = pw.shape[1]
+
+    if saved_hs != config.hs:
+        raise ValueError(
+            f"subject_pw hs={saved_hs} 与当前 hs={config.hs} 不一致: {path}"
+        )
+
+    eval_bs = config.bs
+    if eval_bs == train_bs:
+        return pw
+    if eval_bs < train_bs:
+        log(f"[subject_pw] eval bs={eval_bs} < train bs={train_bs}，使用前 {eval_bs} 个被试")
+        return pw[:eval_bs].clone()
+    return _pad_subject_pw(pw, eval_bs, config, net)
+
+
+def prepare_eval_subject_pw(
+    config, net, model_path=None, subject_pw_path=None
+) -> torch.Tensor | None:
+    """
+    决定 eval 起始 subject_pw：优先加载 checkpoint，否则按 persistent_pw / pw_init_std 初始化。
+    """
+    path = resolve_subject_pw_path(model_path, subject_pw_path)
+    if path is not None:
+        if not path.exists():
+            raise FileNotFoundError(f"未找到 subject_pw 文件: {path}")
+        pw = load_subject_pw(path, config, net)
+        log(f"[subject_pw] 已加载 {path} (shape={tuple(pw.shape)})")
+        return pw
+    if config.persistent_pw:
+        log("[subject_pw] 未找到 checkpoint，使用 init_subject_pw()")
+        return init_subject_pw(config, net)
+    return None
 
 
 def set_seed(seed):
@@ -688,6 +830,7 @@ def _run_episode_blocks(
     print_trace=False,
     collect_responses=False,
     training=False,
+    initial_pw=None,
 ):
     """
     执行 episode 的学习 + 测试 block 循环（训练与 eval 共用）。
@@ -695,7 +838,10 @@ def _run_episode_blocks(
     """
     hidden = net.initialZeroState(config.bs)
     et = net.initialZeroET(config.bs)
-    pw = net.initialZeroPlasticWeights(config.bs)
+    if initial_pw is not None:
+        pw = initial_pw.detach().clone()
+    else:
+        pw = net.initialZeroPlasticWeights(config.bs)
     cue_data = generate_cue_data(config, nbcues)
 
     test_responses = [] if collect_responses else None
@@ -773,8 +919,9 @@ def _run_episode_blocks(
     }
 
 
-def run_episode(config, net, nbcues, print_trace=False):
+def run_episode(config, net, nbcues, print_trace=False, subject_pw=None):
     """运行完整 episode：学习 blocks + 测试 blocks；按 trial 反传，返回损失统计。"""
+    initial_pw = resolve_episode_pw(config, net, subject_pw)
     state = _run_episode_blocks(
         config,
         net,
@@ -782,6 +929,7 @@ def run_episode(config, net, nbcues, print_trace=False):
         print_trace=print_trace,
         collect_responses=False,
         training=True,
+        initial_pw=initial_pw,
     )
 
     pw = state["pw"]
@@ -855,15 +1003,21 @@ def load_network(config, model_path=None):
     return net
 
 
-def run_episode_eval(config, net, nbcues, print_trace=False):
+def run_episode_eval(config, net, nbcues, print_trace=False, subject_pw=None):
     """
     运行 eval episode 并采集 EpisodeRecord（供分析环节使用）。
     不计算训练 loss，不反传梯度。
     """
     torch.set_grad_enabled(False)
     net.eval()
+    initial_pw = resolve_episode_pw(config, net, subject_pw)
     state = _run_episode_blocks(
-        config, net, nbcues, print_trace=print_trace, collect_responses=True
+        config,
+        net,
+        nbcues,
+        print_trace=print_trace,
+        collect_responses=True,
+        initial_pw=initial_pw,
     )
     test_counters = state["test_counters"]
     nbtesttrials = test_counters["nbtesttrials"]
@@ -954,13 +1108,15 @@ def print_episode_summary(config, episode_index, stats, start_time):
     log(f"mean-abs pw: {float(torch.mean(torch.abs(pw))):.6f}")
 
 
-def save_checkpoint(config, net, output_dir, test_rewards):
+def save_checkpoint(config, net, output_dir, test_rewards, subject_pw=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(net.state_dict(), output_dir / ("netAE" + str(config.rngseed) + ".dat"))
     torch.save(net.state_dict(), output_dir / "net.dat")
     with open(output_dir / ("tAE" + str(config.rngseed) + ".txt"), "w") as thefile:
         for item in test_rewards[::10]:
             thefile.write(f"{item}\n")
+    if subject_pw is not None and config.persistent_pw:
+        save_subject_pw(output_dir, config, subject_pw)
     log(f"[save] Wrote checkpoint and test-reward log to {output_dir}")
 
 
@@ -977,10 +1133,15 @@ def train(config, output_dir, trace_steps=False):
         f"[setup] Batch size: {config.bs}; episodes: {config.nbiter}; "
         f"learn_blocks: {config.nb_learn_blocks}; test_blocks: {config.nb_test_blocks}; "
         f"baux_learn={config.baux_learn}; baux_test={config.baux_test}; "
+        f"lpw={config.lpw}; "
         f"learn_shuffle={config.learn_shuffle_presentation}; warmup={config.warmup}; "
+        f"pw_init_std={config.pw_init_std}; persistent_pw={config.persistent_pw}; "
+        f"pw_episode_jitter={config.pw_episode_jitter}; "
         f"output: {output_dir}"
     )
     log(f"[setup] Parameter shapes: {[x.size() for x in net.parameters()]}")
+
+    subject_pw = init_subject_pw(config, net) if config.persistent_pw else None
 
     trace_start = time.time()
     episode_iter = tqdm(
@@ -996,7 +1157,11 @@ def train(config, output_dir, trace_steps=False):
         nbcues = config.nbcues
 
         optimizer.zero_grad()
-        stats = run_episode(config, net, nbcues=nbcues, print_trace=print_trace)
+        stats = run_episode(
+            config, net, nbcues=nbcues, print_trace=print_trace, subject_pw=subject_pw
+        )
+        if config.persistent_pw:
+            subject_pw = stats.final_pw.detach()
         # 梯度已在 run_episode 内按 trial 累积反传
         torch.nn.utils.clip_grad_norm_(net.parameters(), config.gc)
         if episode_index > config.warmup:
@@ -1008,23 +1173,39 @@ def train(config, output_dir, trace_steps=False):
             trace_start = time.time()
 
         if episode_index % config.save_every == 0 and episode_index > 0:
-            save_checkpoint(config, net, output_dir, test_rewards)
+            save_checkpoint(
+                config, net, output_dir, test_rewards, subject_pw=subject_pw
+            )
             if config.analyze_on_save:
-                _run_analysis_checkpoint(config, net, output_dir / "analysis")
+                _run_analysis_checkpoint(
+                    config,
+                    net,
+                    output_dir / "analysis",
+                    subject_pw=subject_pw,
+                    model_path=output_dir / "net.dat",
+                )
+
+    if config.persistent_pw and subject_pw is not None:
+        save_subject_pw(output_dir, config, subject_pw)
 
     return net
 
 
-def _run_analysis_checkpoint(config, net, analysis_dir):
+def _run_analysis_checkpoint(
+    config, net, analysis_dir, subject_pw=None, model_path=None
+):
     """训练过程中 checkpoint 时运行分析（可选）。"""
     from analysis import run_full_analysis
 
     log("[analysis] checkpoint 触发分析环节...")
-    record = run_episode_eval(config, net, nbcues=config.nbcues)
+    eval_pw = subject_pw
+    if eval_pw is None:
+        eval_pw = prepare_eval_subject_pw(config, net, model_path=model_path)
+    record = run_episode_eval(config, net, nbcues=config.nbcues, subject_pw=eval_pw)
     run_full_analysis(record, analysis_dir)
 
 
-def run_analyze_mode(config, model_path, analysis_dir):
+def run_analyze_mode(config, model_path, analysis_dir, subject_pw_path=None):
     """仅运行 eval + 分析（--analyze 模式）。"""
     from analysis import run_full_analysis
 
@@ -1032,9 +1213,15 @@ def run_analyze_mode(config, model_path, analysis_dir):
     analysis_dir = Path(analysis_dir)
     log(
         f"[analyze] batch={config.bs}, learn_blocks={config.nb_learn_blocks}, "
-        f"test_blocks={config.nb_test_blocks}, |S|={config.supervision_size}"
+        f"test_blocks={config.nb_test_blocks}, |S|={config.supervision_size}; "
+        f"pw_init_std={config.pw_init_std}, persistent_pw={config.persistent_pw}"
     )
-    record = run_episode_eval(config, net, nbcues=config.nbcues)
+    subject_pw = prepare_eval_subject_pw(
+        config, net, model_path=model_path, subject_pw_path=subject_pw_path
+    )
+    record = run_episode_eval(
+        config, net, nbcues=config.nbcues, subject_pw=subject_pw
+    )
     report = run_full_analysis(record, analysis_dir)
     log(f"[analyze] 主观排序: {report.subjective_rank}")
     return report
@@ -1101,10 +1288,38 @@ def parse_args():
         help="测试决策步离线 CE 权重（meta-train；行为仍无反馈）",
     )
     parser.add_argument(
+        "--lpw",
+        type=float,
+        default=1e-4,
+        help="episode 内可塑权重 pw 的 L2 惩罚系数",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=100,
         help="episode 0…warmup 不 optimizer.step（论文默认 100）；-1 从 ep0 起每轮更新",
+    )
+    parser.add_argument(
+        "--pw-init-std",
+        type=float,
+        default=0.0,
+        help="每 episode 各 batch 初始 pw ~ N(0, std)；persistent_pw 时亦用于首启",
+    )
+    parser.add_argument(
+        "--persistent-pw",
+        action="store_true",
+        help="batch_index 跨 episode 保留 pw（虚拟被试慢权重）",
+    )
+    parser.add_argument(
+        "--pw-episode-jitter",
+        type=float,
+        default=0.0,
+        help="每 episode 初在 pw 上加 N(0, jitter) 小扰动",
+    )
+    parser.add_argument(
+        "--subject-pw-path",
+        default=None,
+        help="分析时加载的 subject_pw.pt（默认与 --model-path 同目录）",
     )
     parser.add_argument(
         "--trace-steps",
@@ -1130,7 +1345,11 @@ def main():
         learn_shuffle_presentation=not args.no_learn_shuffle,
         baux_learn=args.baux_learn,
         baux_test=args.baux_test,
+        lpw=args.lpw,
         warmup=args.warmup,
+        pw_init_std=args.pw_init_std,
+        persistent_pw=args.persistent_pw,
+        pw_episode_jitter=args.pw_episode_jitter,
     )
     np.set_printoptions(precision=5)
     set_seed(config.rngseed)
@@ -1140,7 +1359,12 @@ def main():
         analysis_dir = (
             Path(args.analysis_dir) if args.analysis_dir else output_dir / "analysis"
         )
-        run_analyze_mode(config, args.model_path, analysis_dir)
+        run_analyze_mode(
+            config,
+            args.model_path,
+            analysis_dir,
+            subject_pw_path=args.subject_pw_path,
+        )
         return
 
     train(config, output_dir, trace_steps=args.trace_steps)
