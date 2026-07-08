@@ -93,6 +93,12 @@ class AnalysisReport:
     n_subject_bimodal: int = 0
     mean_error_consistency: float = float("nan")
     n_subjects_consistent_error_80: int = 0
+    # 逐被试 HodgeRank（Liu Fig 3C/E：个体化主观排序）
+    per_subject_rankings: list = field(default_factory=list)
+    mean_per_subject_tau_vs_true: float = float("nan")
+    mean_inter_subject_tau: float = float("nan")
+    n_subjects_with_wrong_rank: int = 0
+    n_subjects_self_consistent_wrong: int = 0
 
     def to_json_dict(self):
         """转为可 JSON 序列化的字典。"""
@@ -542,6 +548,84 @@ def subjective_rank_from_scores(scores: np.ndarray) -> list[int]:
     return list(np.argsort(-scores))
 
 
+def analyze_per_subject_rankings(
+    responses: list[TestResponse],
+    nbcues: int,
+    true_rank: list[int],
+    tau_wrong_threshold: float = 0.999,
+) -> dict:
+    """
+    逐被试 HodgeRank（对齐 Liu 2026 Fig 3C/E）。
+    检测个体主观排序是否偏离真序，以及被试间排序相似度。
+    """
+    subjects = sorted({r.batch_index for r in responses})
+    per_subject: list[dict] = []
+    ranks: list[list[int]] = []
+
+    for batch in subjects:
+        sub_resp = [r for r in responses if r.batch_index == batch]
+        if not sub_resp:
+            continue
+        R_s = build_response_matrix(sub_resp, nbcues)
+        triads = detect_circular_triads(R_s, nbcues)
+        scores, curl_s = hodge_rank_scores(R_s, nbcues)
+        rank_s = subjective_rank_from_scores(scores)
+        tau = kendall_tau(true_rank, rank_s)
+        rho = spearman_rho(true_rank, rank_s)
+        acc = float(np.mean([r.correct for r in sub_resp]))
+        pair_acc: dict[tuple[int, int], list[int]] = {}
+        for resp in sub_resp:
+            pair_acc.setdefault(resp.pair, []).append(int(resp.correct))
+        ec = subject_error_consistency(
+            {p: float(np.mean(v)) for p, v in pair_acc.items()}
+        )
+        per_subject.append(
+            {
+                "batch_index": int(batch),
+                "subjective_rank": rank_s,
+                "kendall_tau_vs_true": tau,
+                "spearman_rho_vs_true": rho,
+                "curl_ratio": curl_s,
+                "test_accuracy": acc,
+                "n_circular_triads": len(triads),
+                "error_consistency": ec,
+                "self_consistent_wrong": (
+                    tau < tau_wrong_threshold and len(triads) == 0
+                ),
+            }
+        )
+        ranks.append(rank_s)
+
+    if not per_subject:
+        return {
+            "per_subject_rankings": [],
+            "mean_per_subject_tau_vs_true": float("nan"),
+            "mean_inter_subject_tau": float("nan"),
+            "n_subjects_with_wrong_rank": 0,
+            "n_subjects_self_consistent_wrong": 0,
+        }
+
+    pairwise: list[float] = []
+    for i in range(len(ranks)):
+        for j in range(i + 1, len(ranks)):
+            pairwise.append(kendall_tau(ranks[i], ranks[j]))
+
+    n_wrong = sum(
+        1 for item in per_subject if item["kendall_tau_vs_true"] < tau_wrong_threshold
+    )
+    n_sc_wrong = sum(1 for item in per_subject if item["self_consistent_wrong"])
+
+    return {
+        "per_subject_rankings": per_subject,
+        "mean_per_subject_tau_vs_true": float(
+            np.mean([item["kendall_tau_vs_true"] for item in per_subject])
+        ),
+        "mean_inter_subject_tau": float(np.mean(pairwise)) if pairwise else float("nan"),
+        "n_subjects_with_wrong_rank": n_wrong,
+        "n_subjects_self_consistent_wrong": n_sc_wrong,
+    }
+
+
 def kendall_tau(true_rank: list[int], estimated_rank: list[int]) -> float:
     """与真实排序的 Kendall τ。"""
     n = len(true_rank)
@@ -590,6 +674,7 @@ def analyze_episode(record: EpisodeRecord, curl_threshold: float = 0.15) -> Anal
     liu = analyze_liu_behavioral_effects(
         responses, true_rank, record.supervision_set, record.query_set
     )
+    per_subj = analyze_per_subject_rankings(responses, nbcues, true_rank)
 
     return AnalysisReport(
         nbcues=nbcues,
@@ -621,6 +706,11 @@ def analyze_episode(record: EpisodeRecord, curl_threshold: float = 0.15) -> Anal
         n_subject_bimodal=liu["n_subject_bimodal"],
         mean_error_consistency=liu["mean_error_consistency"],
         n_subjects_consistent_error_80=liu["n_subjects_consistent_error_80"],
+        per_subject_rankings=per_subj["per_subject_rankings"],
+        mean_per_subject_tau_vs_true=per_subj["mean_per_subject_tau_vs_true"],
+        mean_inter_subject_tau=per_subj["mean_inter_subject_tau"],
+        n_subjects_with_wrong_rank=per_subj["n_subjects_with_wrong_rank"],
+        n_subjects_self_consistent_wrong=per_subj["n_subjects_self_consistent_wrong"],
     )
 
 
@@ -724,6 +814,7 @@ def plot_analysis_report(report: AnalysisReport, output_dir: Path) -> None:
     plt.close(fig)
 
     _plot_liu_extended(report, output_dir)
+    _plot_per_subject_rankings(report, output_dir)
 
     log(f"[analysis] 图表已保存至 {output_dir}")
 
@@ -796,6 +887,65 @@ def _pick_exemplar_pair(pair_beta_fits: list[dict]) -> dict:
         return float(np.std(accs))
 
     return max(pool, key=_spread)
+
+
+def _plot_per_subject_rankings(report: AnalysisReport, output_dir: Path) -> None:
+    """逐被试主观排序 vs 真序（Liu Fig 3C/E 风格）。"""
+    items = report.per_subject_rankings
+    if not items:
+        return
+
+    nbcues = report.nbcues
+    labels = ALPHABET[:nbcues]
+    x = np.arange(nbcues)
+    true_pos = [report.true_rank.index(i) for i in range(nbcues)]
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(
+        x,
+        true_pos,
+        "o-",
+        label="真实排序",
+        color="green",
+        lw=2.5,
+        markersize=8,
+        zorder=3,
+    )
+    for item in items:
+        rank = item["subjective_rank"]
+        subj_pos = [rank.index(i) for i in range(nbcues)]
+        tau = item["kendall_tau_vs_true"]
+        color = "#c44e52" if tau < 0.999 else "#4c72b0"
+        ax.plot(
+            x,
+            subj_pos,
+            "-",
+            color=color,
+            alpha=0.45,
+            lw=1.0,
+            zorder=1,
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("秩位置（越小越强）")
+    ax.set_title(
+        "逐被试 HodgeRank 主观排序\n"
+        f"错序={report.n_subjects_with_wrong_rank}, "
+        f"自洽错序={report.n_subjects_self_consistent_wrong}, "
+        f"被试间 tau_mean={report.mean_inter_subject_tau:.2f}"
+    )
+    ax.invert_yaxis()
+    from matplotlib.lines import Line2D
+
+    legend_items = [
+        Line2D([0], [0], color="green", lw=2.5, marker="o", label="真实排序"),
+        Line2D([0], [0], color="#4c72b0", lw=1.5, label="被试=真序"),
+        Line2D([0], [0], color="#c44e52", lw=1.5, label="被试≠真序"),
+    ]
+    ax.legend(handles=legend_items, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_dir / "per_subject_rankings.png", dpi=200)
+    plt.close(fig)
 
 
 def _plot_liu_extended(report: AnalysisReport, output_dir: Path) -> None:
@@ -941,6 +1091,8 @@ def run_full_analysis(record: EpisodeRecord, output_dir: Path) -> AnalysisReport
         f"triads={report.n_circular_triads}, curl={report.curl_ratio:.3f}, "
         f"Kendall τ={report.kendall_tau_vs_true:.3f}, "
         f"n_subj={report.n_subjects}, pair_bimodal={report.n_pair_bimodal}, "
-        f"err_consistency={report.mean_error_consistency:.3f}"
+        f"err_consistency={report.mean_error_consistency:.3f}, "
+        f"wrong_rank={report.n_subjects_with_wrong_rank}, "
+        f"inter_subj_τ={report.mean_inter_subject_tau:.3f}"
     )
     return report

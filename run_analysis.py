@@ -49,7 +49,17 @@ def main():
         default=None,
         help="虚拟被试慢权重 subject_pw.pt（默认与 --model-path 同目录自动查找）",
     )
+    ap.add_argument(
+        "--liu-minimal",
+        action="store_true",
+        help="分析时假定 persistent_pw；无 subject_pw 时 pw_init_std=0.08",
+    )
     args = ap.parse_args()
+
+    if args.liu_minimal:
+        args.persistent_pw = True
+        if args.pw_init_std == 0.0:
+            args.pw_init_std = 0.08
 
     config = TrainConfig(
         rngseed=args.seed,

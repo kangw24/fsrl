@@ -329,6 +329,8 @@ def save_subject_pw(output_dir: Path, config, subject_pw: torch.Tensor) -> None:
     """保存训练末各 batch 槽位的可塑慢权重（虚拟被试状态）。"""
     if subject_pw is None:
         return
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "subject_pw": subject_pw.detach().cpu(),
         "train_bs": int(config.bs),
@@ -1121,6 +1123,8 @@ def save_checkpoint(config, net, output_dir, test_rewards, subject_pw=None):
 
 
 def train(config, output_dir, trace_steps=False):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     model_config = config.to_model_dict()
     net = RetroModulRNN(model_config)
     optimizer = torch.optim.Adam(
@@ -1185,8 +1189,7 @@ def train(config, output_dir, trace_steps=False):
                     model_path=output_dir / "net.dat",
                 )
 
-    if config.persistent_pw and subject_pw is not None:
-        save_subject_pw(output_dir, config, subject_pw)
+    save_checkpoint(config, net, output_dir, test_rewards, subject_pw=subject_pw)
 
     return net
 
@@ -1326,11 +1329,32 @@ def parse_args():
         action="store_true",
         help="Print per-step debugging details on summary episodes.",
     )
+    parser.add_argument(
+        "--liu-minimal",
+        action="store_true",
+        help=(
+            "论文对齐训练预设：baux_learn=0, baux_test=0, persistent_pw=True, "
+            "pw_init_std=0.08（可被显式 CLI 参数覆盖）"
+        ),
+    )
     return parser.parse_args()
+
+
+def apply_liu_minimal_preset(args):
+    """应用 Liu 2026 最小对齐预设（仅填充用户未显式指定的项）。"""
+    if not args.liu_minimal:
+        return args
+    args.baux_learn = 0.0
+    args.baux_test = 0.0
+    args.persistent_pw = True
+    if args.pw_init_std == 0.0:
+        args.pw_init_std = 0.08
+    return args
 
 
 def main():
     args = parse_args()
+    args = apply_liu_minimal_preset(args)
     config = TrainConfig(
         rngseed=args.seed,
         bs=args.batch_size,
@@ -1355,6 +1379,8 @@ def main():
     set_seed(config.rngseed)
 
     output_dir = Path(args.output_dir)
+    if args.liu_minimal and str(output_dir) == str(ROOT_DIR):
+        output_dir = ROOT_DIR / "liu_minimal"
     if args.analyze:
         analysis_dir = (
             Path(args.analysis_dir) if args.analysis_dir else output_dir / "analysis"
@@ -1367,6 +1393,11 @@ def main():
         )
         return
 
+    if args.liu_minimal:
+        log(
+            "[liu-minimal] baux_learn=0, baux_test=0, persistent_pw=True, "
+            f"pw_init_std={config.pw_init_std}"
+        )
     train(config, output_dir, trace_steps=args.trace_steps)
 
 
