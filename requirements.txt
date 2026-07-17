@@ -1,6 +1,1 @@
-torch
-numpy
-matplotlib
-scipy
-scikit-learn
-tqdm
+numpy>=1.24
