@@ -1,0 +1,294 @@
+% !TeX program = xelatex
+\documentclass[aspectratio=169,11pt]{beamer}
+
+\usepackage[UTF8,fontset=none]{ctex}
+\IfFileExists{fonts/NotoSansSC-VF.ttf}{
+  \setCJKmainfont[Path=fonts/,Extension=.ttf]{NotoSerifSC-VF}
+  \setCJKsansfont[Path=fonts/,Extension=.ttf]{NotoSansSC-VF}
+  \setCJKmonofont[Path=fonts/,Extension=.ttf]{NotoSansSC-VF}
+}{
+  \IfFileExists{C:/Windows/Fonts/NotoSansSC-VF.ttf}{
+    \setCJKmainfont[Path=C:/Windows/Fonts/,Extension=.ttf]{NotoSerifSC-VF}
+    \setCJKsansfont[Path=C:/Windows/Fonts/,Extension=.ttf]{NotoSansSC-VF}
+    \setCJKmonofont[Path=C:/Windows/Fonts/,Extension=.ttf]{NotoSansSC-VF}
+  }{
+    \setCJKmainfont{FandolSong-Regular}
+    \setCJKsansfont{FandolHei-Regular}
+    \setCJKmonofont{FandolFang-Regular}
+  }
+}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,tabularx,array}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usetikzlibrary{arrows.meta,positioning}
+\pgfplotsset{compat=1.18}
+
+\definecolor{Ink}{HTML}{17324D}
+\definecolor{Teal}{HTML}{147D7E}
+\definecolor{Orange}{HTML}{D97732}
+\definecolor{Red}{HTML}{B64C4C}
+\definecolor{Green}{HTML}{4E8B57}
+\definecolor{Mist}{HTML}{EDF3F6}
+\definecolor{Warm}{HTML}{FFF2E8}
+\definecolor{SoftGreen}{HTML}{EAF4EB}
+\definecolor{GrayText}{HTML}{5B6570}
+
+\usetheme{Madrid}
+\usecolortheme{default}
+\setbeamercolor{normal text}{fg=Ink,bg=white}
+\setbeamercolor{structure}{fg=Teal}
+\setbeamercolor{frametitle}{fg=white,bg=Ink}
+\setbeamercolor{title}{fg=white}
+\setbeamercolor{subtitle}{fg=white}
+\setbeamercolor{author}{fg=white}
+\setbeamercolor{institute}{fg=white}
+\setbeamercolor{date}{fg=white}
+\setbeamercolor{block title}{fg=white,bg=Teal}
+\setbeamercolor{block body}{fg=Ink,bg=Mist}
+\setbeamercolor{alertblock title}{fg=white,bg=Orange}
+\setbeamercolor{alertblock body}{fg=Ink,bg=Warm}
+\setbeamercolor{exampleblock title}{fg=white,bg=Green}
+\setbeamercolor{exampleblock body}{fg=Ink,bg=SoftGreen}
+\setbeamercolor{author in head/foot}{fg=GrayText,bg=white}
+\setbeamercolor{date in head/foot}{fg=GrayText,bg=white}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{headline}{}
+\setbeamertemplate{itemize item}{\color{Teal}$\blacktriangleright$}
+\setbeamertemplate{itemize subitem}{\color{Orange}$\bullet$}
+\setbeamersize{text margin left=0.7cm,text margin right=0.7cm}
+\setbeamertemplate{footline}{%
+  \leavevmode%
+  \hbox{%
+    \begin{beamercolorbox}[wd=.78\paperwidth,ht=2.7ex,dp=1.2ex,leftskip=1em]{author in head/foot}%
+      稀疏关系到个体化全局排序
+    \end{beamercolorbox}%
+    \begin{beamercolorbox}[wd=.22\paperwidth,ht=2.7ex,dp=1.2ex,rightskip=1em plus1fil]{date in head/foot}%
+      \hfill\insertframenumber\,/\,\inserttotalframenumber
+    \end{beamercolorbox}}
+}
+
+\title{CGR-v3.2：研究方法与已有结果}
+\subtitle{稀疏局部关系学习与个体化全局排序}
+\author{FSLR 项目汇报}
+\institute{基于 Liu, Wang \& Luo (2026) 的行为机制复现}
+\date{2026 年 7 月}
+
+\begin{document}
+
+{
+\setbeamercolor{background canvas}{bg=Ink}
+\begin{frame}[plain]
+  \titlepage
+\end{frame}
+}
+
+\section{研究方法与已有结果}
+
+\begin{frame}{研究方法：汪康组}
+  \small
+  \begin{description}
+    \item[实验任务]
+      \begin{itemize}
+        \item 每次完整实验（episode）包含 8 个物品（cue），物品与隐藏等级 A--H 的对应关系随机；
+        \item 学习阶段呈现固定的 8 条局部关系，共重复 4 轮，因此有 32 次关系呈现；
+        \item 每轮内的呈现顺序和左右位置随机，参与者只观察关系，不需要作答；
+        \item 测验阶段比较全部 $\binom{8}{2}=28$ 个物品对，重复 10 轮，共作答 280 次，且没有反馈。
+      \end{itemize}
+
+    \item[状态更新范围]
+      \begin{itemize}
+        \item 每名虚拟被试开始时，模型都会重新初始化内部状态；
+        \item 学习阶段每看到一条关系，就更新关系记忆和当前排序；
+        \item 学习结束后固定最终排序；测验阶段只读取这一排序，不再更新。
+      \end{itemize}
+  \end{description}
+\end{frame}
+
+\begin{frame}{研究方法：汪康组}
+  \small
+  \begin{description}
+    \item[模型输入]
+      \begin{itemize}
+        \item 学习阶段输入两个物品的身份、哪个物品等级更高，以及屏幕显示的带方向等级距离；
+        \item 测验阶段只输入需要比较的两个物品；
+        \item 模型看不到真实排名、正确答案、被试编号或测验反馈。
+      \end{itemize}
+
+    \item[关系记忆]
+      每次看到一条关系时，模型以 $p_{\mathrm{enc}}=0.45$ 的概率将其记住。同一关系共呈现 4 次，因此至少成功记住一次的概率为
+      \[
+        1-(1-0.45)^4=0.9085.
+      \]
+
+    \item[个体先验]
+      每个物品都有一个只在本次实验内有效的随机初始偏置（anchor）：
+      $a_i\sim\mathcal N(0,\sigma_a^2)$，其中 $\sigma_a=0.30$。当学习证据不足时，这一偏置使不同虚拟被试形成不同但稳定的判断。
+
+    \item[全局排序]
+      模型用递归最小二乘（RLS）逐步整合关系信息，得到每个物品的等级分数；随后选择一个不违背已记忆关系的完整排序。所有测验题都从同一个最终排序中读取答案。
+  \end{description}
+\end{frame}
+
+\begin{frame}{评估方法}
+  \small
+  \begin{description}
+    \item[模拟对象]
+      按论文的数据规模模拟 77 名虚拟被试。每名被试先观察 32 次局部关系，再完成 280 次无反馈判断。
+
+    \item[准确率指标]
+      分别统计总体正确率、8 个直接学习物品对、20 个未直接学习物品对，以及不同等级距离下的正确率。
+
+    \item[结构指标]
+      计算不同被试排序之间的 Kendall's $\tau$、同一被试的选择一致性、稳定错误占比和循环三元组数量。
+
+    \item[分布指标]
+      对每个物品对的跨被试准确率进行 Beta 分布拟合，记录按论文标准判定的双峰物品对数量；同时计算模型与人类 28 对准确率曲线的 Pearson 相关。
+  \end{description}
+\end{frame}
+
+\begin{frame}{已有结果：总体表现}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.5\textwidth}
+      \centering
+      \begin{tikzpicture}
+        \begin{axis}[
+          ybar,bar width=9pt,width=\textwidth,height=5.5cm,
+          ymin=0.45,ymax=1.02,
+          symbolic x coords={Overall,Learned,Unlearned,Tau},xtick=data,
+          xticklabels={总体,已学习,未学习,个体间 $\tau$},
+          x tick label style={font=\scriptsize},
+          ylabel={指标值},
+          legend style={at={(0.5,1.02)},anchor=south,legend columns=2,draw=none,font=\scriptsize},
+          nodes near coords,nodes near coords style={font=\tiny,rotate=90,anchor=west}]
+          \addplot[fill=Teal,draw=Teal] coordinates
+            {(Overall,0.8524) (Learned,0.9140) (Unlearned,0.8277) (Tau,0.5807)};
+          \addplot[fill=Orange,draw=Orange] coordinates
+            {(Overall,0.8047) (Learned,0.9099) (Unlearned,0.7627) (Tau,0.5477)};
+          \legend{人类,CGR-v3.2}
+        \end{axis}
+      \end{tikzpicture}
+    \end{column}
+    \begin{column}{0.5\textwidth}
+      \begin{description}
+        \item[直接学习]
+          模型 $0.910$，人类 $0.914$，基本一致。
+        \item[间接推断]
+          模型 $0.763$，人类 $0.828$，模型偏低。
+        \item[个体差异]
+          模型 $\tau=0.548$，人类 $0.581$。
+        \item[题目模式]
+          模型与人类在 28 对题目上的准确率变化较相似，Pearson $r=0.779$。
+      \end{description}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{已有结果：距离效应}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.5\textwidth}
+      \centering
+      \begin{tikzpicture}
+        \begin{axis}[
+          width=\textwidth,height=5.2cm,xmin=1,xmax=7,ymin=0.58,ymax=1.01,
+          xtick={1,2,3,4,5,6,7},
+          xlabel={客观等级距离},ylabel={正确率},
+          grid=major,grid style={draw=Mist},
+          legend style={at={(0.5,1.02)},anchor=south,legend columns=2,draw=none,font=\scriptsize}]
+          \addplot[color=Teal,very thick,mark=*] coordinates
+            {(1,0.7288)(2,0.8167)(3,0.8925)(4,0.9029)(5,0.9662)(6,0.9539)(7,0.9844)};
+          \addplot[color=Orange,very thick,mark=square*] coordinates
+            {(1,0.6338)(2,0.7643)(3,0.8673)(4,0.8948)(5,0.9242)(6,0.9396)(7,0.9429)};
+          \legend{人类,CGR-v3.2}
+        \end{axis}
+      \end{tikzpicture}
+    \end{column}
+    \begin{column}{0.5\textwidth}
+      \small
+      \textcolor{Teal}{\textbf{共同模式}}\par
+      人类和模型都表现出明显的距离效应：两个物品在真实排序中相距越远，判断越准确。
+
+      \vspace{1.2em}
+      \textcolor{Teal}{\textbf{主要差异}}\par
+      当两个物品只相差 1--2 个等级时，模型的正确率低于人类，说明模型对相近物品的推断仍偏弱。
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{已有结果：个体化全局排序}
+  \small
+  \begin{description}
+    \item[稳定性]
+      模型的选择一致性为 $1.000$，人类为 $0.999$。同一虚拟被试在 10 轮测验中几乎始终作出相同选择。
+
+    \item[稳定错误]
+      模型的稳定错误占比为 $0.974$，人类为 $0.883$。这说明模型的错误通常来自固定的主观排序，而不是临时猜测；但模型比人类更少改变选择。
+
+    \item[双峰分布]
+      在 28 个物品对中，人类有 13 对、模型有 14 对呈现双峰分布。这表示不同被试会对同一物品对形成方向相反、但各自稳定的判断。
+
+    \item[传递性]
+      模型的所有答案都来自同一个完整排序，因此不会出现循环关系；人类数据中出现了 2 个循环三元组。
+  \end{description}
+
+  \begin{alertblock}{结果解释}
+    模型同时表现出较高正确率、同一被试内部稳定、不同被试之间有差异，符合“个体化全局排序”的核心现象；但模型的选择比人类更固定。
+  \end{alertblock}
+\end{frame}
+
+\begin{frame}{已有结果：模块消融}
+  \footnotesize
+  \begin{tabularx}{\textwidth}{p{0.22\textwidth}rrrrX}
+    \toprule
+    条件 & 总体 & 直接学习 & 个体间 $\tau$ & 双峰 & 主要结果 \\
+    \midrule
+    完整 CGR-v3.2 & 0.805 & 0.910 & 0.548 & 14 & 同时保留正确率、个体差异和稳定结构 \\
+    去除个体先验 & 0.911 & 0.933 & 0.959 & 0 & 更接近客观排序，但不同被试趋同 \\
+    去除关系记忆 & 0.491 & 0.474 & $-0.004$ & 28 & 缺少有效关系证据，结果退化 \\
+    完整记忆 & 0.811 & 0.917 & 0.567 & 13 & 仅小幅提高准确率 \\
+    去除共享排序读出 & 0.499 & 0.502 & 0.001 & 0 & 选择一致性降至 0.694，循环三元组升至 471 \\
+    \bottomrule
+  \end{tabularx}
+
+  \vspace{0.8em}
+  \begin{description}
+    \item[个体先验]
+      主要负责在相同学习输入下产生稳定的个体差异。
+    \item[关系记忆]
+      负责保存直接学习到的局部关系。
+    \item[共享排序读出]
+      负责被试内自洽性和选择的传递结构。
+  \end{description}
+\end{frame}
+
+\begin{frame}{已有结果：探索路径与对齐}
+  \footnotesize
+
+  \centering
+  \textbf{判断原则：行为相似不等于机制对齐；还要检验关键模块是否必要、个体差异来自哪里。}\par
+  \vspace{0.35em}
+
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.48\textwidth}
+      \begin{alertblock}{探索一：RetroModulRNN}
+        \begin{itemize}
+          \item \textbf{目标：}用神经调控可塑 RNN，让模型自行习得单个 episode 内的记忆与推断策略；
+          \item \textbf{关键失败：}关闭可塑权重写入（plastic write）后，LPD 仅下降
+                $0.0003$--$0.0004$；
+          \item \textbf{判断：}模型表现几乎不依赖其核心快速可塑性，因此不能将该机制作为当前解释。
+        \end{itemize}
+      \end{alertblock}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \begin{block}{探索二：CGR-v1}
+        \begin{itemize}
+          \item \textbf{机制设想：}关系方向 $\rightarrow$ 逐步硬化全序；个体 anchor 用于补全欠定关系；
+          \item \textbf{关键问题：}同 anchor、不同顺序的 $\tau=0.236$；不同 anchor、相同顺序的 $\tau=0.250$；
+          \item \textbf{判断：}呈现顺序和早期硬化主导了差异，而非个体先验。结果相似，但来源没有对齐。
+        \end{itemize}
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\end{document}

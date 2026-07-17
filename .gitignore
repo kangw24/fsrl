@@ -1,7 +1,49 @@
 **/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+**/.ipynb_checkpoints/
 
 .venv/
 
 .vscode/
 
 figures/
+outputs/*
+!outputs/README.md
+!outputs/archive/
+outputs/archive/*
+!outputs/archive/README.md
+!outputs/archive/2026-07-16_legacy_research/
+outputs/archive/2026-07-16_legacy_research/*
+!outputs/archive/2026-07-16_legacy_research/README.md
+*.dat
+*.pt
+*.pkl
+todo.md
+tmp/
+_sweepout.txt
+
+*.log
+
+# Generated Beamer/LaTeX files. Keep the source deck and speaker script only.
+docs/presentation/*.aux
+docs/presentation/*.nav
+docs/presentation/*.out
+docs/presentation/*.pdf
+docs/presentation/*.snm
+docs/presentation/*.synctex.gz
+docs/presentation/*.toc
+docs/presentation/* - 副本.tex
+
+# Local deliverables produced by build scripts.
+output/
+
+# Local research history and archived candidates are not published.
+**/archive/
+**/archived/
+
+# Local presentation narration; publish the source deck and README only.
+docs/presentation/*_speaker_script.md
+
+*.json
